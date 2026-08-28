@@ -176,6 +176,13 @@ flowchart LR
 > **Invariant CACHE-3 — the read path performs no I/O.** No network call, no disk
 > read, no lock acquisition, no allocation that can fail. An evaluation touches an
 > atomic load, a map lookup, a predicate walk, and a hash. Nothing else.
+>
+> **Measured caveat, stated rather than buried:** the non-rollout path is genuinely
+> zero-allocation. The *rollout* path allocates 24 B per evaluation building the
+> bucketing key, because `BucketKeyStrategy.Key` returns a `string`. At 2.4M evals/sec
+> with 20% rollout flags that is ~11 MB/s of garbage. Not a correctness defect, but
+> CACHE-3 is a near-miss rather than a fact on that path. Fixable only by changing the
+> interface to `Key(flag, ctx, dst []byte) ([]byte, bool)`.
 
 | Situation | Cache-first behaviour | What it is NOT |
 |---|---|---|
@@ -215,7 +222,7 @@ but it is now a line item rather than a rounding error.
 
 | # | Consequence |
 |---|---|
-| 1 | **The batch API is mandatory, not a convenience.** 100 individual client calls per request means 100 × per-call overhead. One batch call pins the snapshot once and amortises the entry boundary across all 100 flags |
+| 1 | **The batch API is mandatory — but for CORRECTNESS, not throughput.** The original claim here was that batching amortises the per-call entry boundary. **Measurement falsified it**: `BatchAppend` at F=100 beats 100 individual calls by 0.8% (7,346 ns vs 7,406 ns), because Go 1.26's open-coded defers make the per-call boundary nearly free. Batch earns "mandatory" entirely on CACHE-1 snapshot pinning — one generation for the whole request. `BatchAppend` exists so that pinning costs no allocation; plain `Batch` is *slower* than individual calls because of its 8 KB result slice |
 | 2 | **Rule-count-per-flag is now a budgeted resource.** A single 20-rule flag evaluated 100 times per request is 340 µs of the 1 ms budget. Lint should warn above ~10 rules per flag, and §7 adds a rule-count gauge |
 
 ### 4.2 Memory per application pod
@@ -247,12 +254,12 @@ change. Traffic could grow 100x without the flag service noticing.
 ```mermaid
 flowchart LR
     subgraph before["Without cache - load follows traffic"]
-        T1["12,000 RPS"] --> E1["600,000 evaluations/s"]
-        E1 --> FS1["Flag service<br/>600,000 RPS<br/>tier 1 dependency"]
+        T1["12,000 RPS"] --> E1["2.4M evaluations/s"]
+        E1 --> FS1["Flag service<br/>2.4M RPS<br/>tier 1 dependency"]
     end
 
     subgraph after["With cache - load follows fleet"]
-        T2["12,000 RPS"] --> E2["600,000 evaluations/s"]
+        T2["12,000 RPS"] --> E2["2.4M evaluations/s"]
         E2 --> L1C["in process snapshot<br/>zero network"]
         POD["40 pods"] --> FS2["Flag service<br/>40 streams<br/>control plane"]
     end

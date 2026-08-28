@@ -1,0 +1,130 @@
+# golangci-lint configuration (v2 schema).
+#
+# Philosophy: a linter config that cries wolf gets disabled entirely, so this
+# enables a small set that has been earned rather than everything available.
+# Each linter below is here because it catches a class of bug this codebase can
+# actually ship. If a linter starts producing noise instead of findings, remove
+# it here rather than sprinkling //nolint through the source.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    # Unchecked errors. This service's whole contract is "never throw", which is
+    # only implementable if every error is deliberately handled or deliberately
+    # discarded in writing.
+    - errcheck
+    # The stdlib correctness suite: printf verbs, lost cancels, copied locks.
+    - govet
+    # Supersedes gosimple, stylecheck, and the old staticcheck. The highest
+    # signal-to-noise analyser in the ecosystem.
+    - staticcheck
+    # Assignments that are never read. Usually a misread error variable.
+    - ineffassign
+    # Dead identifiers. Ring 0 must stay small; unused code is how it stops being.
+    - unused
+    # Typos in comments and strings. Cheap, and the docs are load-bearing here.
+    - misspell
+    # Style rules, deliberately a short list - see settings below.
+    - revive
+    # Unclosed HTTP response bodies. The client holds long-lived streams; a leaked
+    # body is a leaked connection and eventually a leaked file descriptor.
+    - bodyclose
+    # Security smells. Tuned below - the noisy integer-conversion rule is off.
+    - gosec
+
+  settings:
+    errcheck:
+      # An ignored type assertion is how a nil interface becomes a panic in a
+      # package whose entire purpose is not panicking.
+      check-type-assertions: true
+      # `_ = f()` is an explicit, reviewable decision. Leave it alone.
+      check-blank: false
+
+    govet:
+      enable:
+        - nilness
+      # fieldalignment and shadow are off on purpose: both are high-volume and
+      # mostly taste. Hot-path struct layout is argued in review, not by a linter.
+      disable:
+        - fieldalignment
+        - shadow
+
+    misspell:
+      # The design docs and code comments are written in British English
+      # ("behaviour", "optimisation"). US locale would flag every one of them.
+      locale: UK
+
+    revive:
+      severity: warning
+      # Explicit rule list. revive's default set is broad; this is the subset
+      # that catches real defects rather than preferences.
+      rules:
+        - name: exported
+          arguments:
+            - disableStutteringCheck
+        - name: var-naming
+        - name: indent-error-flow
+        - name: errorf
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: unreachable-code
+        - name: redefines-builtin-id
+        - name: time-naming
+        - name: range-val-in-closure
+        - name: waitgroup-by-value
+        - name: unconditional-recursion
+        - name: defer
+          arguments:
+            - ["loop", "recover", "return"]
+
+    gosec:
+      excludes:
+        # G115 integer overflow conversion. The bucket maths converts between
+        # uint64, uint32 and int32 by design and the ranges are proven by the
+        # golden vectors; G115 fires on every one of them.
+        - G115
+        # G404 weak random. Nothing here uses randomness for security - jitter on
+        # reconnect backoff is the only use, and it must not be crypto/rand.
+        - G404
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # Tests are allowed to be blunt. They construct deliberately broken input,
+      # ignore errors from fixture setup, and use fixed seeds.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - bodyclose
+          - revive
+      # Golden-vector and fixture files are data, not prose.
+      - path: testdata/
+        linters:
+          - misspell
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+  settings:
+    gofmt:
+      simplify: true
+
+issues:
+  # Report everything. Truncating at 3-per-linter hides the scale of a problem
+  # and makes "the lint is clean now" mean nothing.
+  max-issues-per-linter: 0
+  max-same-issues: 0
