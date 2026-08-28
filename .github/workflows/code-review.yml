@@ -1,0 +1,294 @@
+name: Code Review
+
+# Six review dimensions run in parallel against the PR diff, each writing machine-readable
+# findings. A single aggregate job merges them, deduplicates, and posts one comment that it
+# edits in place on every push - so a long-lived PR accumulates a current review, not a
+# stack of stale ones.
+#
+# Why parallel dimensions rather than one "review this PR" call: a single pass spreads its
+# attention across everything and reliably misses the narrow, expensive bugs. A reviewer
+# told to look only at bucketing compatibility, holding only that context, finds the
+# re-bucketing hazard. Splitting also means one dimension crashing does not take the review
+# with it - the aggregate report names the gap instead of quietly shrinking.
+#
+# The dimension prompts live in .github/review/ and are committed on purpose. They are the
+# review contract: they change through a reviewed diff, not by editing a personal harness
+# that CI cannot see. (.claude/ is gitignored here, so CI could not read it anyway.)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      # Docs-only pushes do not need six model invocations. Note this makes the job
+      # skip entirely on such PRs, which is why it must stay advisory rather than a
+      # required check - a skipped required check blocks a merge forever.
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/**"
+      - ".github/review/**"
+  workflow_dispatch:
+    inputs:
+      fail_on:
+        description: "Lowest severity that fails the gate"
+        type: choice
+        default: blocking
+        options: [blocking, major, minor, never]
+
+# A second push supersedes the review of the first. Six parallel model calls per push is
+# the single largest cost in this repo's CI; cancelling is not optional.
+concurrency:
+  group: review-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Decide whether to review at all, once, so six matrix jobs do not each
+  # re-evaluate the same conditions.
+  # ---------------------------------------------------------------------------
+  gate:
+    name: should review
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      base: ${{ steps.decide.outputs.base }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - id: decide
+        env:
+          # Fork PRs do not receive secrets on public repositories, which is the
+          # documented behaviour and the reason this workflow uses `pull_request`
+          # rather than `pull_request_target`. pull_request_target would run this
+          # file from the base branch WITH secrets while checking out untrusted
+          # head code - a well-known privilege-escalation footgun. Skipping forks
+          # is the sanctioned trade-off: a fork PR gets human review instead.
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          HAS_SKIP_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'skip-review') }}
+          HAS_SECRET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          echo "base=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+
+          decide() {
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=$1" >> "$GITHUB_OUTPUT"
+            echo "::notice::skipping review - $1"
+            exit 0
+          }
+
+          [ "${HAS_SECRET}" = "true" ]     || decide "ANTHROPIC_API_KEY is not configured"
+          [ "${IS_FORK}" = "false" ]       || decide "pull request is from a fork; secrets are withheld by design"
+          [ "${IS_DRAFT}" != "true" ]      || decide "pull request is a draft"
+          [ "${HAS_SKIP_LABEL}" = "false" ] || decide "the skip-review label is present"
+
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "reason=ok" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # One job per dimension. fail-fast is off: a dimension that errors must not
+  # cancel the other five, or one flaky call costs the whole review.
+  # ---------------------------------------------------------------------------
+  review:
+    name: ${{ matrix.dimension }}
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Required by the action's default GitHub App authentication.
+      id-token: write
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          - dimension: correctness-contracts
+            prompt: .github/review/01-correctness-contracts.md
+          - dimension: concurrency-hotpath
+            prompt: .github/review/02-concurrency-hotpath.md
+          - dimension: bucketing-compatibility
+            prompt: .github/review/03-bucketing-compatibility.md
+          - dimension: config-merge-validation
+            prompt: .github/review/04-config-merge-validation.md
+          - dimension: security-observability
+            prompt: .github/review/05-security-observability.md
+          - dimension: api-operability
+            prompt: .github/review/06-api-operability.md
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history: the reviewer diffs against the merge base, and a shallow
+          # clone has no merge base to diff against.
+          fetch-depth: 0
+
+      # Go is set up so a reviewer can compile or run a single test to confirm a
+      # hypothesis rather than guessing. Findings that were checked beat findings
+      # that were reasoned about.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Prepare findings directory
+        run: mkdir -p findings
+
+      - name: Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are performing one dimension of a parallel code review on a pull request.
+
+            1. Read `.github/review/_house-rules.md`. It defines the severity scale, the
+               exact JSON output schema, and the standards this repository commits to.
+            2. Read `${{ matrix.prompt }}`. That is your dimension. Stay inside it — five
+               other reviewers are covering the other dimensions concurrently, so do not
+               broaden your scope to compensate for what you think they might miss.
+            3. Get the diff under review:
+                   git diff ${{ needs.gate.outputs.base }}...HEAD
+               Review only that diff. Read surrounding files for context freely, but a
+               finding must be caused by, or newly exposed by, this diff.
+            4. You may compile and run tests to confirm a hypothesis. A finding you
+               verified outranks one you inferred — set `verdict` accordingly.
+            5. Write your findings to `findings/${{ matrix.dimension }}.json`, exactly in
+               the schema from the house rules, with `"dimension": "${{ matrix.dimension }}"`.
+
+            Write that file even if you find nothing: an empty `findings` array is a valid
+            and frequently correct result, and the aggregator reports a missing file as a
+            failed reviewer rather than as a clean one.
+
+            Report only defects you can state a concrete failure scenario for. Five
+            confirmed findings are worth more than twenty speculative ones — a review that
+            cries wolf gets ignored, and then it is worse than no review at all.
+          claude_args: >-
+            --max-turns 40
+            --model claude-opus-4-8
+            --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(go build:*),Bash(go test:*),Bash(go vet:*),Bash(gofmt:*)"
+
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-${{ matrix.dimension }}
+          path: findings/${{ matrix.dimension }}.json
+          # A missing file is meaningful, so do not fail the upload over it - the
+          # aggregator is what turns absence into a reported gap.
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Merge, deduplicate, and post exactly one comment, edited in place.
+  # ---------------------------------------------------------------------------
+  aggregate:
+    name: aggregate and comment
+    needs: [gate, review]
+    # always(): a dimension failing is precisely when the report matters most,
+    # because the report is what says the review was incomplete.
+    if: always() && needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download findings
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: review-*
+          merge-multiple: false
+
+      - name: Aggregate
+        id: agg
+        continue-on-error: true
+        run: |
+          python3 .github/review/aggregate.py \
+            --artifacts artifacts \
+            --out review.md \
+            --sha "${{ github.event.pull_request.head.sha }}" \
+            --fail-on "${{ inputs.fail_on || 'blocking' }}"
+
+      - name: Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- claude-parallel-review -->';
+            let body;
+            try {
+              body = fs.readFileSync('review.md', 'utf8');
+            } catch {
+              body = marker + '\n## Parallel code review\n\n' +
+                '> [!WARNING]\n> The aggregator did not produce a report. ' +
+                'Treat this as **no review**, not as a pass. See the workflow log.\n';
+            }
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            // One comment per PR, edited in place. A new comment per push buries the
+            // conversation and makes the newest review the hardest thing to find.
+            const existing = await github.paginate(
+              github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 }
+            );
+            const mine = existing.find(c =>
+              c.user.type === 'Bot' && c.body && c.body.includes(marker)
+            );
+
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+              core.info(`updated comment ${mine.id}`);
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              core.info('created review comment');
+            }
+
+      - name: Gate
+        # Advisory for now, matching the golangci-lint job's stance in ci.yml and for
+        # the same reason: a gate introduced against a tree still being written turns
+        # the first false positive into a reason to delete the whole workflow. The
+        # comment lands either way, so the findings are never hidden - only the red X
+        # is deferred.
+        #
+        # Flip to `false` once the review has run clean for a few PRs and the team
+        # trusts the signal. That is the whole migration.
+        continue-on-error: true
+        run: |
+          if [ "${{ steps.agg.outcome }}" = "failure" ]; then
+            echo "::error::review gate failed - see the PR comment for findings"
+            exit 1
+          fi
+          echo "review gate passed"
+
+  # ---------------------------------------------------------------------------
+  # Make a skip visible. A workflow that silently does nothing looks identical to
+  # one that reviewed and approved.
+  # ---------------------------------------------------------------------------
+  skipped:
+    name: review skipped
+    needs: gate
+    if: needs.gate.outputs.run == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "::notice title=Code review skipped::${{ needs.gate.outputs.reason }}"
+          echo "No automated review ran: ${{ needs.gate.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"

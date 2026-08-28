@@ -19,6 +19,30 @@ env:
   GO_VERSION: "1.26"
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Static gates. Cheap, so they share one runner -- splitting three commands
+  # that take seconds each across three runners spends more on setup than it
+  # saves. The suites below are where the wall-clock actually is, and those DO
+  # fan out.
+  # ---------------------------------------------------------------------------
+  static:
+    name: static (fmt, vet, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - run: go mod download
+
+      # gofmt exits 0 whether or not it found unformatted files -- it reports by
+      # PRINTING filenames, not through its exit status. Checking $? here is the
+      # classic way to ship a formatting gate that can never fail. Test the output.
   verify:
     name: build, vet, test
     runs-on: ubuntu-latest
@@ -48,6 +72,7 @@ jobs:
           if [ -n "$unformatted" ]; then
             echo "::error::these files are not gofmt-clean:"
             echo "$unformatted"
+            gofmt -s -d .
             echo ""
             echo "diff:"
             gofmt -s -d .
@@ -63,6 +88,66 @@ jobs:
       - name: go build
         run: go build ./...
 
+      # go.mod / go.sum must already be tidy. Catching drift here is what stops a
+      # dependency arriving in the tree without anyone deciding to add it.
+      - name: go mod tidy is a no-op
+        run: |
+          set -euo pipefail
+          cp go.mod /tmp/go.mod.bak
+          cp go.sum /tmp/go.sum.bak
+          go mod tidy
+          if ! diff -q /tmp/go.mod.bak go.mod >/dev/null || ! diff -q /tmp/go.sum.bak go.sum >/dev/null; then
+            echo "::error::go mod tidy changed go.mod or go.sum; commit the result"
+            diff -u /tmp/go.mod.bak go.mod || true
+            diff -u /tmp/go.sum.bak go.sum || true
+            exit 1
+          fi
+          echo "modules: tidy"
+
+  # ---------------------------------------------------------------------------
+  # Test suites, fanned out. fail-fast is OFF on purpose: when two suites break
+  # you want to see both on the first run, not discover the second after fixing
+  # the first.
+  # ---------------------------------------------------------------------------
+  test:
+    name: ${{ matrix.suite.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - name: unit
+            packages: ./internal/... ./pkg/...
+          - name: integration (two-client E2E)
+            packages: ./test/e2e/...
+          - name: walkthrough and scenario
+            packages: ./test/demo/... ./test/scenario/...
+          - name: load (correctness guards)
+            packages: ./test/load/...
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - run: go mod download
+
+      # -race is not negotiable. The whole propagation design rests on an atomic
+      # pointer swap under concurrent readers, and a data race on a Go map is a
+      # FATAL runtime error that recover() cannot contain -- it would break the
+      # never-throw contract itself, which is the product promise.
+      #
+      # -count=1 defeats the test result cache, so a green tick always means the
+      # tests actually ran against this commit.
+      - name: go test -race
+        run: |
+          go test -race -count=1 -covermode=atomic \
+            -coverprofile=coverage-${{ strategy.job-index }}.txt \
+            ${{ matrix.suite.packages }}
       # -race is not optional here. The whole config-propagation design rests on
       # an atomic pointer swap under concurrent readers; a data race in that swap
       # is a fatal runtime error in Go that recover() cannot contain.
@@ -72,6 +157,60 @@ jobs:
       - name: Coverage summary
         if: always()
         run: |
+          f=coverage-${{ strategy.job-index }}.txt
+          [ -f "$f" ] && go tool cover -func="$f" | tail -n 1 || echo "no profile"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-${{ strategy.job-index }}
+          path: coverage-${{ strategy.job-index }}.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Performance criteria. Runs WITHOUT -race, deliberately: the race detector
+  # adds 5-20x overhead, so timing measured under it is meaningless. The load
+  # suite skips its timing scenarios when -race is set, which is why they need
+  # their own job to run at all.
+  #
+  # Advisory. A shared CI runner is noisy, contended, and nothing like the
+  # machine these numbers were measured on -- failing a PR on a p99 measured
+  # there would train everyone to ignore the job. It publishes the table so a
+  # regression is visible; it does not block.
+  # ---------------------------------------------------------------------------
+  perf:
+    name: performance criteria (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - run: go mod download
+
+      - name: Pass criteria P1-P5
+        run: go test -count=1 -run TestPassCriteria -v ./test/load/... 2>&1 | tee perf.txt
+
+      - name: Publish to the run summary
+        if: always()
+        run: |
+          {
+            echo "### Performance criteria"
+            echo ""
+            echo "Advisory. Measured on a shared CI runner, not on reference hardware."
+            echo ""
+            echo '```'
+            grep -E "P[1-5]|PASS|FAIL|ns/|µs|MB" perf.txt | head -40 || cat perf.txt | head -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
           if [ -f coverage.txt ]; then
             go tool cover -func=coverage.txt | tail -n 1
           fi
@@ -89,6 +228,15 @@ jobs:
     name: golangci-lint (advisory)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Deliberately non-blocking. The linter is being introduced against a tree
+    # still being written; making it a merge gate on day one means the first
+    # person to hit a false positive disables the whole job. Flip this to false
+    # once the backlog is at zero -- tracked in CONTRIBUTING.md.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
     # Deliberately non-blocking for now. The linter is being introduced against a
     # tree that is still being written; making it a merge gate on day one means
     # the first person to hit a false positive disables the whole job. Flip
@@ -106,6 +254,35 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          args: --timeout=5m
+
+  # ---------------------------------------------------------------------------
+  # One check to require in branch protection.
+  #
+  # Without this, protecting the branch means listing every matrix leg by name,
+  # and adding a suite later silently leaves it unprotected -- the gate passes
+  # because nobody remembered to add it. This job depends on all of them and
+  # fails if any did not succeed. `if: always()` is essential: a needs-job that
+  # fails would otherwise SKIP this one, and a skipped required check reads as
+  # green.
+  # ---------------------------------------------------------------------------
+  ci-gate:
+    name: CI gate
+    runs-on: ubuntu-latest
+    needs: [static, test]
+    if: always()
+    steps:
+      - name: Verify every required job succeeded
+        run: |
+          echo "static: ${{ needs.static.result }}"
+          echo "test:   ${{ needs.test.result }}"
+          if [ "${{ needs.static.result }}" != "success" ] || [ "${{ needs.test.result }}" != "success" ]; then
+            echo "::error::a required CI job did not succeed"
+            exit 1
+          fi
+          echo "all required jobs passed"
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
