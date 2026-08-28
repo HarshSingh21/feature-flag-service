@@ -204,5 +204,15 @@ type Flag struct {
 	EvaluationOrder EvaluationOrder `json:"evaluation_order,omitempty"`
 }
 
-// HasRollout reports whether a percentage rollout is configured.
-func (f *Flag) HasRollout() bool { return f.Rollout != nil && f.Rollout.BasisPoints > 0 }
+// NOTE: there is deliberately no HasRollout helper.
+//
+// The obvious one -- `Rollout != nil && BasisPoints > 0` -- is a trap. It reports
+// false for a configured 0% rollout, which would route evaluation to FALLTHROUGH
+// and return flag.DefaultValue. A flag being ramped from zero very often has
+// DefaultValue set to the ON value, because that is what the ramp targets. So
+// "set it to 0%" would switch the feature on for everyone: the exact inverse of
+// what the operator typed.
+//
+// The correct gate is `Rollout != nil`, with a 0% rollout returning
+// Rollout.OffValue and ReasonRolloutOut. See evaluator.go stage S6 and
+// TestZeroPercentRolloutReturnsTheRolloutOffValueNotTheFlagDefault.
