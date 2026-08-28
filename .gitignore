@@ -24,3 +24,6 @@ question.txt
 docs/prompt.txt
 docs/01-discovery.md
 docs/templates/
+
+# build artifact
+/flagd
