@@ -37,8 +37,14 @@ because `F` is invisible in the RPS figure the product team quotes.
 |---|---|---|---|
 | Remote RPC per evaluation, F=100 | 44 ms | **208 ms** | ❌ off by 200x. 100 sequential RPCs per request |
 | Remote RPC, batched into 1 call | 0.44 ms | **2.08 ms** | ❌ still misses by 2x, before load |
-| **Local eval on cached snapshot, F=100** | **~30 µs** | **~340 µs** | ✅ inside 1 ms with margin |
-| Local eval, single flag | ~0.3 µs | ~3.4 µs | reference cost |
+| **Local eval on cached snapshot, F=100** | **7.50 µs measured** | **15.17 µs measured** | ✅ **66x margin** |
+| Local eval, single flag | 0.048 µs measured | — | plain flag, 0 allocations |
+
+**Measured, not estimated** (Apple M5, 10 cores, go1.26.3, `test/load`). The estimates
+in the first version of this table — ~30 µs p50 and ~340 µs p99 — were **pessimistic by
+4x and 22x**. Per-evaluation cost is 0.079 µs typical against ~0.3 µs claimed, and
+2.224 µs worst-case against ~3.4 µs. Recomputed, the pathological corner is **5.3 cores,
+not 8.16**: the design's conclusion survives, but its arithmetic was wrong.
 
 The remote number is not slow code. It is scheduling, cross-AZ RTT, and TLS —
 irreducible. **No amount of server optimisation moves a network hop under a
@@ -222,7 +228,7 @@ but it is now a line item rather than a rounding error.
 
 | # | Consequence |
 |---|---|
-| 1 | **The batch API is mandatory — but for CORRECTNESS, not throughput.** The original claim here was that batching amortises the per-call entry boundary. **Measurement falsified it**: `BatchAppend` at F=100 beats 100 individual calls by 0.8% (7,346 ns vs 7,406 ns), because Go 1.26's open-coded defers make the per-call boundary nearly free. Batch earns "mandatory" entirely on CACHE-1 snapshot pinning — one generation for the whole request. `BatchAppend` exists so that pinning costs no allocation; plain `Batch` is *slower* than individual calls because of its 8 KB result slice |
+| 1 | **The batch API is mandatory — but for CORRECTNESS, not throughput.** The original claim here was that batching amortises the per-call entry boundary. **Measurement falsified it, twice, independently**: `BatchAppend` at F=100 beats 100 individual calls by 0.8% (7,346 ns vs 7,406 ns) in one harness and by 5% (7,487 ns vs 7,856 ns) in another, because Go 1.26's open-coded defers make the per-call boundary nearly free. Batch earns "mandatory" entirely on CACHE-1 snapshot pinning — one generation for the whole request. `BatchAppend` exists so that pinning costs no allocation; plain `Batch` is *slower* than individual calls because of its 8 KB result slice |
 | 2 | **Rule-count-per-flag is now a budgeted resource.** A single 20-rule flag evaluated 100 times per request is 340 µs of the 1 ms budget. Lint should warn above ~10 rules per flag, and §7 adds a rule-count gauge |
 
 ### 4.2 Memory per application pod
