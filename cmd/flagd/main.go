@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/HarshSingh21/feature-flag-service/internal/config"
 	"github.com/HarshSingh21/feature-flag-service/internal/core"
 	"github.com/HarshSingh21/feature-flag-service/internal/obs"
 	httpx "github.com/HarshSingh21/feature-flag-service/internal/transport/http"
@@ -37,6 +38,7 @@ type options struct {
 	adminAddr       string
 	logLevel        string
 	instanceID      string
+	environments    string
 	requiredEnvs    string
 	shutdownTimeout time.Duration
 	handlerTimeout  time.Duration
@@ -56,6 +58,7 @@ func parseOptions(args []string) (options, error) {
 	fs.StringVar(&o.adminAddr, "admin-addr", env("FLAGD_ADMIN_ADDR", ":9090"), "listen address for the admin API")
 	fs.StringVar(&o.logLevel, "log-level", env("FLAGD_LOG_LEVEL", "info"), "debug | info | warn | error")
 	fs.StringVar(&o.instanceID, "instance-id", env("FLAGD_INSTANCE_ID", defaultInstanceID()), "identity of this replica, stamped on every log line")
+	fs.StringVar(&o.environments, "environments", env("FLAGD_ENVIRONMENTS", ""), "comma-separated environments this instance serves; empty uses the store default of dev,staging,prod")
 	fs.StringVar(&o.requiredEnvs, "required-envs", env("FLAGD_REQUIRED_ENVS", ""), "comma-separated environments that must have a snapshot before /ready succeeds")
 	fs.DurationVar(&o.shutdownTimeout, "shutdown-timeout", envDuration("FLAGD_SHUTDOWN_TIMEOUT", 25*time.Second), "bound on draining in-flight requests at SIGTERM")
 	fs.DurationVar(&o.handlerTimeout, "handler-timeout", envDuration("FLAGD_HANDLER_TIMEOUT", 3*time.Second), "per-request handler deadline")
@@ -100,7 +103,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	deps, err := wire(ctx, log, rec)
+	deps, err := wire(ctx, log, rec, splitCSV(opts.environments))
 	if err != nil {
 		return fmt.Errorf("wiring dependencies: %w", err)
 	}
@@ -161,47 +164,27 @@ var _ httpx.Evaluator = (*core.Evaluator)(nil)
 
 // wire builds the service's dependencies.
 //
-// The evaluator is real. The CONFIG STORE is the remaining stub.
-//
-// TODO(config): wire internal/config. Three lines change, and only three:
-//
-//	store := config.New(...)
-//	deps.Snapshots = storeSource{store}   // adapter below; see the note on it
-//	deps.Applier   = &storeApplier{store} // unmarshal Layer, call store.Set,
-//	                                      // map BuildReport -> httpx.ApplyResult,
-//	                                      // and wrap operator mistakes with
-//	                                      // httpx.ErrValidation so they answer 400
-//	                                      // and never page
-//
-// config.Store already exposes Snapshot(env) (*config.ResolvedSnapshot, bool) and
-// Environments() []string, and *config.ResolvedSnapshot satisfies core.Snapshot, so
-// the adapter is a return-type widening and nothing more. ResolvedSnapshot.BuiltAt()
-// also makes httpx.FreshnessReporter a two-line addition, which is what lights up the
-// staleness field on /ready and /health.
-//
-// Until then the stub is deliberately honest rather than convenient: the snapshot
-// source reports that nothing has loaded, so /ready answers 503 and this pod takes no
-// traffic. A stub that pretended to be ready would be the exact failure hazard H6
-// describes -- a fleet quietly serving compile-time defaults with every dashboard
-// green.
-func wire(_ context.Context, log *obs.Logger, rec *obs.Recorder) (httpx.Deps, error) {
-	log.Warn(context.Background(), "config store is not wired; serving no snapshots and reporting NOT ready",
-		obs.KeyEvent, "startup.stub_wiring")
+// The evaluator, the config store, and the admin applier are all real. The
+// adapters that join them to the transport live in wiring.go; each exists only to
+// bridge a type, and each carries the reason it cannot be elided.
+func wire(_ context.Context, log *obs.Logger, rec *obs.Recorder, envs []string) (httpx.Deps, error) {
+	opts := []config.Option{}
+	if len(envs) > 0 {
+		opts = append(opts, config.WithEnvironments(envs...))
+	}
+	store := config.New(opts...)
+
+	log.Info(context.Background(), "config store wired",
+		obs.KeyEvent, "startup.config_wired")
+
 	return httpx.Deps{
-		Snapshots: emptySnapshotSource{},
+		Snapshots: storeSource{st: store},
 		Evaluator: core.New(),
-		Applier:   nil, // admin apply answers 503 until the real applier is wired
+		Applier:   layerApplier{st: store},
 		Log:       log,
 		Metrics:   rec,
 	}, nil
 }
-
-// emptySnapshotSource has never loaded anything. It is not an error state -- see
-// internal/transport/http/deps.go -- but it does keep /ready false.
-type emptySnapshotSource struct{}
-
-func (emptySnapshotSource) Snapshot(string) (core.Snapshot, bool) { return nil, false }
-func (emptySnapshotSource) Environments() []string                { return nil }
 
 func parseLevel(s string) (slog.Level, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {

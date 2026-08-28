@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -198,6 +199,17 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	}
 }
 
+// mustPath fails the test rather than propagating the containment error, which
+// path only returns for an input encodeEnvName cannot produce.
+func mustPath(t *testing.T, fs *FileStore, env string) string {
+	t.Helper()
+	p, err := fs.path(env)
+	if err != nil {
+		t.Fatalf("path(%q): %v", env, err)
+	}
+	return p
+}
+
 func TestFileStoreSanitisesEnvironmentIntoPath(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -209,8 +221,106 @@ func TestFileStoreSanitisesEnvironmentIntoPath(t *testing.T) {
 	if len(ents) != 1 {
 		t.Fatalf("expected exactly one file in dir, got %d", len(ents))
 	}
-	if got := filepath.Dir(fs.path("../../etc/passwd")); got != dir {
+	if got := filepath.Dir(mustPath(t, fs, "../../etc/passwd")); got != dir {
 		t.Fatalf("path escaped the cache directory: %s", got)
+	}
+}
+
+// TestFileStoreEnvironmentNamesDoNotCollide is the regression test for
+// cross-environment config bleed.
+//
+// The encoding used to fold every unusual byte to '_', so "prod!" and "prod?"
+// resolved to one file. The consequence was not a cosmetic filename clash: two
+// clients would overwrite each other's last-known-good, and the next cold start
+// during an outage would hydrate a pod with a *different* environment's flag
+// config, carrying a plausible generation and looking healthy while doing it.
+func TestFileStoreEnvironmentNamesDoNotCollide(t *testing.T) {
+	t.Parallel()
+	fs := NewFileStore(t.TempDir(), nil)
+	// Every one of these folded onto "prod_" or "prod" under the old encoding,
+	// and the empty name folded onto "default".
+	names := []string{"prod", "prod!", "prod?", "prod/", "prod_", "prod.", "Prod", "PROD", "", "default", "~", "prod~21"}
+	seen := make(map[string]string, len(names))
+	for _, env := range names {
+		p := mustPath(t, fs, env)
+		if prev, dup := seen[p]; dup {
+			t.Fatalf("environments %q and %q share a last-known-good file %s", prev, env, filepath.Base(p))
+		}
+		seen[p] = env
+	}
+	// Case folding is the same bug one layer down: on macOS and Windows a
+	// filename that differs only by case is the same file, so distinct paths are
+	// necessary but not sufficient. Uppercase is escaped, so no two of these
+	// differ only by case.
+	lowered := make(map[string]string, len(names))
+	for p, env := range seen {
+		low := strings.ToLower(p)
+		if prev, dup := lowered[low]; dup {
+			t.Fatalf("environments %q and %q collide on a case-insensitive filesystem: %s", prev, env, filepath.Base(p))
+		}
+		lowered[low] = env
+	}
+}
+
+// TestFileStoreRoundTripsAnAwkwardEnvironmentName proves the escaped name is a
+// usable filename on this platform, not merely a distinct string.
+func TestFileStoreRoundTripsAnAwkwardEnvironmentName(t *testing.T) {
+	t.Parallel()
+	fs := NewFileStore(t.TempDir(), nil)
+	for _, env := range []string{"prod!", "eu west/1", "", "Prod"} {
+		if err := fs.Save(env, fixture(7)); err != nil {
+			t.Fatalf("Save(%q): %v", env, err)
+		}
+		got, _, err := fs.Load(env)
+		if err != nil {
+			t.Fatalf("Load(%q): %v", env, err)
+		}
+		if got.Generation() != 7 {
+			t.Fatalf("Load(%q) generation = %d, want 7", env, got.Generation())
+		}
+	}
+}
+
+// TestFileStoreSaveClosesTheTempFileExactlyOnce pins the double-close fix. The
+// old Save closed in the defer as well as on the success path, so the deferred
+// Close always failed with os.ErrClosed and threw the result away, hiding any
+// genuine close error behind a self-inflicted one.
+func TestFileStoreSaveClosesTheTempFileExactlyOnce(t *testing.T) {
+	t.Parallel()
+	// A directory Save has to create itself, so the 0750 mode is actually
+	// exercised: MkdirAll leaves an existing directory's mode alone.
+	dir := filepath.Join(t.TempDir(), "l2")
+	fs := NewFileStore(dir, nil)
+	if err := fs.Save("prod", fixture(3)); err != nil {
+		t.Fatal(err)
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly the renamed file: the temp is gone, and the rename was not
+	// followed by a remove of the final name.
+	if len(ents) != 1 || ents[0].Name() != filepath.Base(mustPath(t, fs, "prod")) {
+		t.Fatalf("unexpected cache directory contents: %v", ents)
+	}
+	// A second Save over the top must also leave exactly one file, which is the
+	// path where a spurious deferred Close/Remove would show up.
+	if err := fs.Save("prod", fixture(4)); err != nil {
+		t.Fatal(err)
+	}
+	if ents, err = os.ReadDir(dir); err != nil || len(ents) != 1 {
+		t.Fatalf("after resave: %v %v", ents, err)
+	}
+	got, _, err := fs.Load("prod")
+	if err != nil || got.Generation() != 4 {
+		t.Fatalf("Load after resave = %v, %v; want generation 4", got, err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o027 != 0 {
+		t.Fatalf("cache directory mode = %04o, want no group-write or world access", perm)
 	}
 }
 
@@ -218,7 +328,7 @@ func TestFileStoreRefusesForeignFormat(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	fs := NewFileStore(dir, nil)
-	if err := os.WriteFile(fs.path("prod"), []byte(`{"format":999,"env":"prod"}`), 0o644); err != nil {
+	if err := os.WriteFile(mustPath(t, fs, "prod"), []byte(`{"format":999,"env":"prod"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// Mis-reading persisted config is worse than having none, so a file this
@@ -232,7 +342,7 @@ func TestUnreadableL2LeavesClientUninitializedNotBroken(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	fs := NewFileStore(dir, nil)
-	if err := os.WriteFile(fs.path("prod"), []byte("{ not json"), 0o644); err != nil {
+	if err := os.WriteFile(mustPath(t, fs, "prod"), []byte("{ not json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	c := newTestClient(t, refEvaluator(), WithL2Store(fs))
