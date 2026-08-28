@@ -13,7 +13,7 @@
 | # | Decision | Value | Source |
 |---|---|---|---|
 | L1 | Deployment shape | Standalone Flag Evaluation Service + thin Go client | your call |
-| L2 | Language / runtime | Go 1.21+ | your call |
+| L2 | Language / runtime | Go 1.26 | your call |
 | L3 | Evaluation locus | Backend service ONLY. Browser/mobile never evaluate | your call |
 | L4 | Config layering | Helm-style: base layer + per-environment overlays, deep-merged | your call |
 | L5 | Persistence | In-memory only. No DB, no admin UI, no multi-region | brief, out of scope |
@@ -164,10 +164,10 @@ inversion, and the availability decoupling argument.
 
 | Finding | Consequence |
 |---|---|
-| The unit of load is **evaluations, not requests** — 12,000 RPS x 8 flags = 96,000/s, peak worst case 600,000/s | `F` is invisible in the quoted RPS figure. This is the number capacity plans miss |
+| The unit of load is **evaluations, not requests** — 12,000 RPS x 30 flags = 360,000/s, peak worst case 2,400,000/s | `F` is invisible in the quoted RPS figure. This is the number capacity plans miss |
 | A per-evaluation RPC is **2.08 ms p99** against a sub-ms budget | Disqualified on arithmetic. No server optimisation moves a network hop under 1 ms at p99 |
 | Local evaluation on a cached snapshot is **~0.3 to 3.4 µs** | ~300x margin. Resolves O5 |
-| Caching converts **O(traffic) into O(pods)** | Flag service goes from 600,000 RPS to ~0. Traffic could grow 100x unnoticed |
+| Caching converts **O(traffic) into O(pods)** | Flag service goes from 2.4M RPS to ~0. Traffic could grow 100x unnoticed |
 | Sticky bucketing is **computed, never stored** | 0 bytes at 1B users. Storing assignments would be ~16 GB *per flag* |
 | Per-evaluation result caching is **rejected** | Evaluation is 0.3 µs; a cache lookup plus invalidation costs more than it saves |
 | Availability **decouples** | Per-request RPC caps app availability at the flag service's. Cached, a flag-service outage degrades freshness only |
@@ -176,7 +176,7 @@ inversion, and the availability decoupling argument.
 | **No hard cache expiry** | Expiring converts a freshness problem into an availability outage. Named risk: kill switches will not propagate during a total outage |
 | **Cache is filled by the write path, post-merge** | Cache update is the last stage of the merge pipeline — build, validate, then swap. Never lazy, never fill-on-miss |
 | **Read path is cache-first with no fallback fetch** | An unknown flag is an *answer*, not a cache miss. The read path performs no I/O at all — invariant CACHE-3 |
-| **Read-through caching rejected** | Fill-on-miss makes the first request after every change pay a fetch, and concurrent cold-key requests stampede the origin. At 600,000 evaluations/sec that is an outage, not a blip. Filling on the write path removes the failure mode instead of mitigating it |
+| **Read-through caching rejected** | Fill-on-miss makes the first request after every change pay a fetch, and concurrent cold-key requests stampede the origin. At 2.4M evaluations/sec that is an outage, not a blip. Filling on the write path removes the failure mode instead of mitigating it |
 
 **Entry condition.** O1–O4 closed.
 **Exit criteria.** Every exported symbol has a stated contract, including its behaviour on nil, missing attribute, and wrong type.
