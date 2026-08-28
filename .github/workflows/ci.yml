@@ -43,6 +43,28 @@ jobs:
       # gofmt exits 0 whether or not it found unformatted files -- it reports by
       # PRINTING filenames, not through its exit status. Checking $? here is the
       # classic way to ship a formatting gate that can never fail. Test the output.
+  verify:
+    name: build, vet, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # Caches GOMODCACHE and GOCACHE, keyed on go.sum.
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Download modules
+        run: go mod download
+
+      # gofmt exits 0 whether or not it found unformatted files - it reports by
+      # printing filenames, not by its exit status. Checking $? here is the
+      # classic way to ship a formatting gate that never fails. Test the output.
       - name: gofmt
         run: |
           set -euo pipefail
@@ -51,6 +73,10 @@ jobs:
             echo "::error::these files are not gofmt-clean:"
             echo "$unformatted"
             gofmt -s -d .
+            echo ""
+            echo "diff:"
+            gofmt -s -d .
+            echo ""
             echo "fix with: make fmt"
             exit 1
           fi
@@ -122,6 +148,11 @@ jobs:
           go test -race -count=1 -covermode=atomic \
             -coverprofile=coverage-${{ strategy.job-index }}.txt \
             ${{ matrix.suite.packages }}
+      # -race is not optional here. The whole config-propagation design rests on
+      # an atomic pointer swap under concurrent readers; a data race in that swap
+      # is a fatal runtime error in Go that recover() cannot contain.
+      - name: go test -race
+        run: go test -race -covermode=atomic -coverprofile=coverage.txt -count=1 ./...
 
       - name: Coverage summary
         if: always()
@@ -180,6 +211,19 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+          if [ -f coverage.txt ]; then
+            go tool cover -func=coverage.txt | tail -n 1
+          fi
+
+      - name: Upload coverage profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-profile
+          path: coverage.txt
+          if-no-files-found: warn
+          retention-days: 7
+
   lint:
     name: golangci-lint (advisory)
     runs-on: ubuntu-latest
@@ -193,6 +237,18 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
+    # Deliberately non-blocking for now. The linter is being introduced against a
+    # tree that is still being written; making it a merge gate on day one means
+    # the first person to hit a false positive disables the whole job. Flip
+    # continue-on-error to false once the backlog is at zero - tracked in
+    # CONTRIBUTING.md.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -227,3 +283,7 @@ jobs:
             exit 1
           fi
           echo "all required jobs passed"
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          args: --timeout=5m

@@ -1,5 +1,19 @@
 # feature-flag-service
 
+Testing result : <img width="1446" height="822" alt="image" src="https://github.com/user-attachments/assets/0f13209f-35d1-4694-a266-d08c5a0b09e8" />
+an operator walks a limit from 70 to 700 in steps of ten, 63 writes back to back. A series fails in ways
+one write cannot: a step goes missing, two arrive out of order, a value moves
+without its generation, or the client quietly falls back to the caller's default.
+`test/e2e/ramp_test.go` asserts on the whole sequence. Two mechanisms, proving
+two different things:
+
+- **Completeness** — the foreground loop refuses to advance until the client has
+  actually read the value just written. No step can be silently skipped.
+- **Ordering** — a watcher goroutine samples the client every 200 µs underneath
+  the entire ramp and the record is replayed at the end. Ordering is not a
+  property any single read can show.
+  
+##### Service overview 
 A feature flag service for Go backends: boolean, string and integer flags with
 attribute targeting, sticky percentage rollouts, and per-environment config that
 goes live in under five seconds without a restart.

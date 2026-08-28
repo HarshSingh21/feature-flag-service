@@ -343,4 +343,3 @@ func buildOverlay(t *testing.T, banner string) *config.OverlayLayer {
 	}
 	return &l
 }
-package scenario
