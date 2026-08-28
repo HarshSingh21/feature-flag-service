@@ -149,8 +149,8 @@ func validEnv(s string) bool { return validToken(s, 32) }
 // validFlagKey bounds the flag key, for the same reason.
 func validFlagKey(s string) bool { return validToken(s, 128) }
 
-func validToken(s string, max int) bool {
-	if s == "" || len(s) > max {
+func validToken(s string, maxLen int) bool {
+	if s == "" || len(s) > maxLen {
 		return false
 	}
 	for i := 0; i < len(s); i++ {

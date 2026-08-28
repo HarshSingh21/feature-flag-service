@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -204,26 +205,85 @@ func NewFileStore(dir string, codec Codec) *FileStore {
 	return &FileStore{dir: dir, codec: codec}
 }
 
-func (f *FileStore) path(env string) string {
-	// The environment name reaches us from configuration and is interpolated
-	// into a path, so it is sanitised rather than trusted.
-	safe := make([]rune, 0, len(env))
-	for _, r := range env {
+// path resolves the on-disk location of env's snapshot, or reports that the
+// resolved path would escape f.dir.
+//
+// The environment name reaches us from configuration and is interpolated into a
+// path, so it is encoded rather than trusted. Two properties are required, and
+// the second one is the one that bites.
+//
+// It must not escape the cache directory: encodeEnvName emits no path
+// separators, so containment holds by construction, and is then asserted
+// anyway — "unreachable" is one refactor away from "exploitable" when the value
+// being interpolated arrived from configuration.
+//
+// It must be injective. The previous encoding mapped every byte outside
+// [A-Za-z0-9-_] to '_', which meant "prod!", "prod?" and "prod/" all resolved to
+// the same file. Two clients with genuinely different environments would then
+// take turns overwriting each other's last-known-good, and a cold start during
+// an outage would hydrate a pod with another environment's flag config —
+// silently, with a plausible generation number, and looking exactly like a
+// working pod. Cross-environment config bleed is the worst thing this cache can
+// do, so distinct names must resolve to distinct files.
+func (f *FileStore) path(env string) (string, error) {
+	p := filepath.Clean(filepath.Join(f.dir, "flags-"+encodeEnvName(env)+".json"))
+	if filepath.Dir(p) != filepath.Clean(f.dir) {
+		return "", fmt.Errorf("client: environment %q resolves outside the cache directory %s", env, f.dir)
+	}
+	return p, nil
+}
+
+// envEscape introduces a two-hex-digit byte escape in an encoded environment
+// name. It is excluded from the verbatim set below so that an escape sequence
+// can never be forged by a literal character, which is what keeps the encoding
+// injective.
+const envEscape = '~'
+
+// encodeEnvName maps an environment name to a filename component injectively:
+// distinct names always produce distinct components, so no two environments can
+// share a last-known-good file.
+//
+// Bytes in [a-z0-9-_] survive verbatim, so ordinary names ("prod", "staging-eu",
+// "eu_west_1") stay readable in a directory listing at 3am, which is most of the
+// value of naming the file after the environment at all. Every other byte,
+// including every uppercase letter, becomes ~XX. Uppercase is escaped rather
+// than kept because macOS and Windows fold filename case: left verbatim, "Prod"
+// and "prod" would be injective as strings and still collide as files, which is
+// the same bug one layer down. Environment names are lowercase by convention, so
+// this costs readability only for names that are already unconventional.
+//
+// Decoding is unambiguous — '~' always begins exactly three bytes — which is the
+// proof of injectivity, even though nothing needs to decode today.
+func encodeEnvName(env string) string {
+	if env == "" {
+		// The empty name cannot encode to itself, and must not collapse onto an
+		// environment genuinely called "default", as the previous version did.
+		// "~empty" is unreachable for every non-empty input because an escape is
+		// always '~' plus two hex digits, and 'm' is not a hex digit.
+		return "~empty"
+	}
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(env))
+	for i := 0; i < len(env); i++ {
+		c := env[i]
 		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-			safe = append(safe, r)
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_':
+			b.WriteByte(c)
 		default:
-			safe = append(safe, '_')
+			b.WriteByte(envEscape)
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0x0f])
 		}
 	}
-	if len(safe) == 0 {
-		safe = []rune("default")
-	}
-	return filepath.Join(f.dir, "flags-"+string(safe)+".json")
+	return b.String()
 }
 
 func (f *FileStore) Load(env string) (core.Snapshot, time.Time, error) {
-	p := f.path(env)
+	p, err := f.path(env)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
 	st, err := os.Stat(p)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -231,7 +291,12 @@ func (f *FileStore) Load(env string) (core.Snapshot, time.Time, error) {
 		}
 		return nil, time.Time{}, err
 	}
-	b, err := os.ReadFile(p)
+	// Cleaned again at the syscall boundary. path has already cleaned this path
+	// and checked that it resolves inside f.dir, and Clean is idempotent, so this
+	// costs nothing and changes nothing — it keeps the guarantee legible (to a
+	// reader and to the security scanner) at the point where a file is actually
+	// opened, rather than three frames away in a helper someone may later edit.
+	b, err := os.ReadFile(filepath.Clean(p))
 	if err != nil {
 		return nil, time.Time{}, err
 	}
@@ -248,23 +313,50 @@ func (f *FileStore) Load(env string) (core.Snapshot, time.Time, error) {
 // crash or a full disk mid-write leaves the previous last-known-good intact
 // rather than a truncated file that fails to parse on the next cold start.
 func (f *FileStore) Save(env string, snap core.Snapshot) error {
-	if err := os.MkdirAll(f.dir, 0o755); err != nil {
+	final, err := f.path(env)
+	if err != nil {
+		return err
+	}
+	// 0750 rather than 0755: this directory holds a full copy of one
+	// environment's flag configuration, including rule attribute names, and
+	// nothing about it needs to be world-readable on a shared host.
+	if err := os.MkdirAll(f.dir, 0o750); err != nil {
 		return err
 	}
 	b, err := f.codec.Encode(snap)
 	if err != nil {
 		return err
 	}
-	final := f.path(env)
 	tmp, err := os.CreateTemp(f.dir, ".flags-*.tmp")
 	if err != nil {
 		return err
 	}
 	name := tmp.Name()
+
+	// Cleanup is conditional on what actually happened, which fixes a real
+	// defect rather than just quietening a linter. The previous version closed
+	// the file in the defer *and* on the success path, so the deferred Close
+	// returned os.ErrClosed on every successful save and discarded it. That made
+	// a self-inflicted error indistinguishable from a genuine one — and a Close
+	// error is the one that reports data lost between the write and the platter
+	// on a delayed-allocation filesystem, which for this cache means a
+	// last-known-good file that will fail to parse on the next cold start.
+	// Now each branch runs only when it is the one thing left to do, and each
+	// discarded error is discarded in writing, with the reason.
+	closed, renamed := false, false
 	defer func() {
-		tmp.Close()
-		os.Remove(name) // no-op once the rename has succeeded
+		if !closed {
+			// Reached only on a failure path that is already returning the
+			// error that matters, for a temp file about to be removed.
+			_ = tmp.Close()
+		}
+		if !renamed {
+			// Best effort. A stale .flags-*.tmp is untidy, not harmful, and
+			// there is no caller who could act on the failure to remove it.
+			_ = os.Remove(name)
+		}
 	}()
+
 	if _, err := tmp.Write(b); err != nil {
 		return err
 	}
@@ -274,7 +366,12 @@ func (f *FileStore) Save(env string, snap core.Snapshot) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, final)
+	closed = true
+	if err := os.Rename(name, final); err != nil {
+		return err
+	}
+	renamed = true
+	return nil
 }
 
 // MemSnapshot is an immutable, map-backed core.Snapshot.

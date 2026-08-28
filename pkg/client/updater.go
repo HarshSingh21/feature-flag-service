@@ -59,7 +59,7 @@ type Source interface {
 type BackoffFunc func(attempt int) time.Duration
 
 // FullJitterBackoff is the default reconnect strategy: a uniformly random delay
-// in [0, min(cap, base*2^attempt)).
+// in [0, min(maxDelay, base*2^attempt)].
 //
 // The jitter is the entire point, not a refinement. Unjittered exponential
 // backoff is synchronised backoff: when the flag service restarts, forty pods
@@ -67,12 +67,12 @@ type BackoffFunc func(attempt int) time.Duration
 // offsets forever, converting a restart into a self-inflicted thundering herd
 // that keeps the service from coming up. Full jitter spreads the fleet across
 // the whole window and de-correlates it permanently.
-func FullJitterBackoff(base, max time.Duration) BackoffFunc {
+func FullJitterBackoff(base, maxDelay time.Duration) BackoffFunc {
 	if base <= 0 {
 		base = 100 * time.Millisecond
 	}
-	if max < base {
-		max = base
+	if maxDelay < base {
+		maxDelay = base
 	}
 	return func(attempt int) time.Duration {
 		if attempt < 0 {
@@ -82,8 +82,8 @@ func FullJitterBackoff(base, max time.Duration) BackoffFunc {
 			attempt = 30
 		}
 		window := base << uint(attempt)
-		if window > max || window <= 0 {
-			window = max
+		if window > maxDelay || window <= 0 {
+			window = maxDelay
 		}
 		return time.Duration(rand.Int64N(int64(window) + 1))
 	}

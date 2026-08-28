@@ -59,7 +59,7 @@ var allowedLabelNames = map[string]bool{
 	"env":    true, // bounded, ~5, and validated at the transport edge
 	"reason": true, // closed Go enum, 10 values
 	"result": true, // closed enum: ok | rejected_validation | rejected_internal
-	"stage":  true, // closed enum: validate | resolve | build | serialize | publish
+	"stage":  true, // closed enum: validate | resolve | build | serialise | publish
 	"state":  true, // closed enum: connected | acked_current
 	"route":  true, // fixed set of registered routes, never a raw request path
 	"method": true, // HTTP verbs

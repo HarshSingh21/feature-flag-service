@@ -69,7 +69,11 @@ type stateMachine struct {
 	mu sync.Mutex
 
 	readyOnce sync.Once
-	readyCh   chan struct{}
+	// readyCh is closed the first time the client leaves StateUninitialized,
+	// whether via the network or via L2 disk. It is what waitForReady — and so
+	// the exported WaitForReady — selects on, and it is closed exactly once so
+	// that a later transition cannot close a closed channel.
+	readyCh chan struct{}
 
 	onChange func(from, to State, reason string)
 }
@@ -82,10 +86,6 @@ func newStateMachine(onChange func(from, to State, reason string)) *stateMachine
 }
 
 func (sm *stateMachine) state() State { return State(sm.cur.Load()) }
-
-// ready is closed the first time the client leaves StateUninitialized, whether
-// via the network or via L2 disk. It is what WaitForReady selects on.
-func (sm *stateMachine) ready() <-chan struct{} { return sm.readyCh }
 
 // set performs a transition, emitting the change hook exactly once per actual
 // move. Re-entering the state you are already in is a no-op, not an event: a

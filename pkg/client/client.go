@@ -137,47 +137,56 @@ type Metrics interface {
 // The hot per-evaluation counter deliberately bypasses this wrapper, because it
 // is already inside a recover boundary and does not need a second defer at
 // 2.4M calls/sec.
+//
+// Every method below repeats `defer func() { _ = recover() }()` verbatim, and
+// that duplication is deliberate rather than an oversight. recover reports a
+// panic only when it is called *directly* by the deferred function, so factoring
+// the line into a shared helper is a loaded gun: `defer helper()` does work, but
+// the moment anyone rewrites it as `defer func() { helper() }()` — which
+// compiles, reads correctly and passes review — recover sits one frame too deep,
+// returns nil, and the panic carries on unwinding. Because these hooks also run
+// inside the evaluation path's own recover handler, such a panic escapes the
+// never-throw boundary entirely. Eight honest lines cannot be broken that way.
+// TestPanicInsideARecoverHandlerStillYieldsTheDefault is the regression test.
 type guardedMetrics struct{ m Metrics }
 
-func recoverHook() { _ = recover() }
-
 func (g guardedMetrics) Evaluation(f string, r core.Reason) {
-	defer recoverHook()
+	defer func() { _ = recover() }()
 	g.m.Evaluation(f, r)
 }
 
 func (g guardedMetrics) UninitializedEvaluation(f string) {
-	defer recoverHook()
+	defer func() { _ = recover() }()
 	g.m.UninitializedEvaluation(f)
 }
 
 func (g guardedMetrics) StateChanged(from, to State) {
-	defer recoverHook()
+	defer func() { _ = recover() }()
 	g.m.StateChanged(from, to)
 }
 
 func (g guardedMetrics) Generation(gen int64) {
-	defer recoverHook()
+	defer func() { _ = recover() }()
 	g.m.Generation(gen)
 }
 
 func (g guardedMetrics) Connected(c bool) {
-	defer recoverHook()
+	defer func() { _ = recover() }()
 	g.m.Connected(c)
 }
 
 func (g guardedMetrics) Staleness(s float64) {
-	defer recoverHook()
+	defer func() { _ = recover() }()
 	g.m.Staleness(s)
 }
 
 func (g guardedMetrics) Resync(r string) {
-	defer recoverHook()
+	defer func() { _ = recover() }()
 	g.m.Resync(r)
 }
 
 func (g guardedMetrics) L2Write(err error) {
-	defer recoverHook()
+	defer func() { _ = recover() }()
 	g.m.L2Write(err)
 }
 

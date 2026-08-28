@@ -285,6 +285,89 @@ type explodingMetrics struct{ NopMetrics }
 
 func (explodingMetrics) Evaluation(string, core.Reason) { panic("metrics exploded") }
 
+// allExplodingMetrics panics from every hook, including the ones the client
+// calls from *inside* its own recover handlers. It deliberately does not embed
+// NopMetrics: the point is that no hook is safe.
+type allExplodingMetrics struct{}
+
+func (allExplodingMetrics) Evaluation(string, core.Reason) { panic("Evaluation exploded") }
+func (allExplodingMetrics) UninitializedEvaluation(string) { panic("UninitializedEvaluation exploded") }
+func (allExplodingMetrics) StateChanged(State, State)      { panic("StateChanged exploded") }
+func (allExplodingMetrics) Generation(int64)               { panic("Generation exploded") }
+func (allExplodingMetrics) Connected(bool)                 { panic("Connected exploded") }
+func (allExplodingMetrics) Staleness(float64)              { panic("Staleness exploded") }
+func (allExplodingMetrics) Resync(string)                  { panic("Resync exploded") }
+func (allExplodingMetrics) L2Write(error)                  { panic("L2Write exploded") }
+
+// TestPanicInsideARecoverHandlerStillYieldsTheDefault is the regression test for
+// the guardedMetrics recover boundary, and the only thing standing between this
+// package and a silent loss of the never-throw contract.
+//
+// The failure mode is specific. The evaluator panics; detail's deferred handler
+// recovers it and calls onPanic; onPanic calls a caller-supplied metrics hook,
+// which panics too. That second panic is raised *inside* the deferred function,
+// so no recover further up the stack can ever see it — it escapes detail
+// entirely and reaches the application as a crash. It is contained only because
+// each guardedMetrics method calls recover directly from its own deferred
+// literal, which is the one and only form the language honours: rewriting that
+// literal as `defer func() { sharedHelper() }()` puts recover a frame too deep,
+// returns nil, and re-opens exactly this hole while still looking correct. If
+// that ever happens, this test is what fails.
+func TestPanicInsideARecoverHandlerStillYieldsTheDefault(t *testing.T) {
+	t.Parallel()
+	c := newTestClient(t, &panicEvaluator{}, WithMetrics(allExplodingMetrics{}),
+		WithLogger(LoggerFunc(func(context.Context, Level, string, ...any) { panic("logger exploded") })))
+	ctx := context.Background()
+
+	// Uninitialized: no snapshot, so UninitializedEvaluation panics on the way
+	// out of the evaluation.
+	if got := c.BoolValue(ctx, "checkout_v2", true, core.EvalContext{UserID: "u"}); !got {
+		t.Fatal("uninitialized evaluation with a panicking hook must return the caller default")
+	}
+
+	// Applying a fixture drives a state transition, so StateChanged panics too.
+	applyFixture(c, 4)
+
+	if got := c.BoolValue(ctx, "checkout_v2", true, core.EvalContext{UserID: "u"}); !got {
+		t.Fatal("a panicking evaluator plus a panicking hook must still return the caller default")
+	}
+	if got := c.StringValue(ctx, "theme", "light", core.EvalContext{}); got != "light" {
+		t.Fatal("a panicking evaluator plus a panicking hook must still return the caller default")
+	}
+	if got := c.IntValue(ctx, "max_items", 11, core.EvalContext{}); got != 11 {
+		t.Fatal("a panicking evaluator plus a panicking hook must still return the caller default")
+	}
+	d := c.BoolDetail(ctx, "checkout_v2", true, core.EvalContext{})
+	if d.Reason != core.ReasonError {
+		t.Fatalf("reason = %s, want ERROR", d.Reason)
+	}
+	if v, ok := d.Value.AsBool(); !ok || !v {
+		t.Fatal("detail must carry the caller default after a recovered panic")
+	}
+
+	// The batch path has the same shape: a per-element recover handler that
+	// calls the same hooks.
+	out := c.Batch(ctx, []Request{
+		{Flag: "theme", Default: core.String("light")},
+		{Flag: "max_items", Default: core.Int(11)},
+	})
+	if v, _ := out[0].Value.AsString(); v != "light" {
+		t.Fatal("batch element must carry the caller default after a recovered panic")
+	}
+	if v, _ := out[1].Value.AsInt(); v != 11 {
+		t.Fatal("batch element must carry the caller default after a recovered panic")
+	}
+
+	// Close transitions the state machine, so the hook panics once more on the
+	// way down; a shutdown must not throw either.
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := c.BoolValue(ctx, "checkout_v2", true, core.EvalContext{}); !got {
+		t.Fatal("evaluation after Close with panicking hooks must return the caller default")
+	}
+}
+
 // TestBatchPinsOneSnapshotAcrossAConcurrentSwap is invariant CACHE-1.
 //
 // A swapper goroutine advances the generation continuously while batches of 64

@@ -22,6 +22,13 @@ func TestParseSemverAccepts(t *testing.T) {
 		{in: "1.0.0-rc.1+exp.sha.5114f85", major: 1, pre: "rc.1", hasPre: true},
 		{in: "1.0.0+0.build.1-rc", major: 1}, // '-' inside build metadata is not a prerelease
 		{in: "18446744073709551615.0.0", major: 1<<64 - 1},
+		// The patch field is parsed last, after prerelease and build have already been
+		// split off the tail. These pin that the split happened -- a parser that took
+		// the patch field before splitting would either reject these or silently swallow
+		// the suffix. See TestParseSemverPatchConsumesTheWholeRemainder.
+		{in: "1.2.3-alpha", major: 1, minor: 2, patch: 3, pre: "alpha", hasPre: true},
+		{in: "1.2.3+build", major: 1, minor: 2, patch: 3},
+		{in: "1.2.3-alpha+build", major: 1, minor: 2, patch: 3, pre: "alpha", hasPre: true},
 	}
 	for _, tc := range tests {
 		got, ok := parseSemver(tc.in)
