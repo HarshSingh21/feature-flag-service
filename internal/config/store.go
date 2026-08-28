@@ -31,6 +31,13 @@ type BuildReport struct {
 // EnvResult is one environment's outcome.
 type EnvResult struct {
 	Env string `json:"env"`
+	// ContentChanged reports whether the published snapshot actually differs from
+	// the one it replaced. False means the build was accepted and the generation
+	// advanced, but nothing a client evaluates changed -- so subscribers were NOT
+	// woken. Distinguishing this from Published is what stops a retried bad push
+	// from churning the whole fleet.
+	ContentChanged bool
+
 	// Published reports whether a new snapshot was swapped in.
 	Published bool `json:"published"`
 	// Generation is the generation now serving. Unchanged when Published is false.
@@ -538,6 +545,24 @@ func (s *Store) buildEnvLocked(env string, now time.Time) EnvResult {
 	}
 
 	// ---- Publication. The last stage, and a single atomic swap. --------------
+	//
+	// The generation ALWAYS advances on an accepted build. It is the operator's
+	// audit counter: "my push landed" must be answerable, and a push that changed
+	// nothing still happened.
+	//
+	// Waking subscribers is a separate decision. A build producing byte-identical
+	// content and an identical quarantine set is not a change to anything a client
+	// evaluates, and notifying anyway is actively harmful: every client re-fetches
+	// and re-swaps for nothing, and propagation metrics fire for a change that did
+	// not happen -- polluting the very signal used to detect the changes that did.
+	//
+	// The case that forced the split: a push whose flags are ALL quarantined still
+	// reaches publication, because flag-level quarantine is not an env-level
+	// rejection. A CI job retrying a bad layer would otherwise churn the whole
+	// fleet on every attempt while the served config never changed. Found by the
+	// end-to-end walkthrough in test/demo.
+	prevSnap := st.cur.Load()
+
 	st.gen++
 	snap := b.build(st.gen, now)
 	st.cur.Store(snap)
@@ -546,8 +571,29 @@ func (s *Store) buildEnvLocked(env string, now time.Time) EnvResult {
 	res.Generation = snap.Generation()
 	res.QuarantinedFlags = snap.QuarantinedKeys()
 
+	contentUnchanged := prevSnap != nil &&
+		prevSnap.Fingerprint() == snap.Fingerprint() &&
+		sameKeys(prevSnap.QuarantinedKeys(), snap.QuarantinedKeys())
+	res.ContentChanged = !contentUnchanged
+
+	if contentUnchanged {
+		return res
+	}
 	st.notify(snap)
 	return res
+}
+
+// sameKeys reports whether two sorted key slices are identical.
+func sameKeys(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func sortedMapKeys[V any](m map[string]V) []string {
