@@ -1,0 +1,26 @@
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Go
+bin/
+dist/
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Local state
+.env
+.env.local
+*.local
+
+# Personal agent harness — not part of the public deliverable
+.claude/
+
+# Scratch / prior unrelated exercise
+question.txt
+docs/prompt.txt
+docs/01-discovery.md
+docs/templates/
